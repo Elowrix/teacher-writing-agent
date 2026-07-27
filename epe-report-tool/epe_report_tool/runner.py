@@ -17,6 +17,7 @@ from .analytics import (
     build_validation_table,
     normalize_text,
 )
+from .registry_enrichment import enrich_from_registries
 from .registry_jan2024 import load_january_2024_from_registry
 from .report_writer import write_excel, write_powerpoint, write_word
 from .scope import apply_analysis_scope, build_exclusion_table
@@ -44,13 +45,21 @@ class ReportRunner:
         master, source_quality = analyzer.load_files(epe_files)
         registry_inventory = self._inventory_registry_files(registry_files)
 
-        jan_frame, jan_quality = self._load_january_2024(registry_files)
-        if not jan_frame.empty:
-            master = pd.concat([master, jan_frame], ignore_index=True, sort=False) if not master.empty else jan_frame
-            master = analyzer._apply_last_sitting_rule(master)
-            master = analyzer._derive_fields(master)
-        if jan_quality:
-            source_quality = pd.concat([source_quality, pd.DataFrame([jan_quality])], ignore_index=True, sort=False)
+        # Use the registry-derived January 2024 fallback only when the original
+        # 2023_2024_EPE source was not selected.
+        original_jan_present = (
+            not master.empty
+            and "analysis_exam_id" in master
+            and master["analysis_exam_id"].eq("2023-24_OCAK").any()
+        )
+        if not original_jan_present:
+            jan_frame, jan_quality = self._load_january_2024(registry_files)
+            if not jan_frame.empty:
+                master = pd.concat([master, jan_frame], ignore_index=True, sort=False) if not master.empty else jan_frame
+                master = analyzer._apply_last_sitting_rule(master)
+                master = analyzer._derive_fields(master)
+            if jan_quality:
+                source_quality = pd.concat([source_quality, pd.DataFrame([jan_quality])], ignore_index=True, sort=False)
 
         if master.empty:
             details = "\n".join(
@@ -61,6 +70,15 @@ class ReportRunner:
                 "Seçilen dosyalardan analiz tablosu üretilemedi. Dosya adlarını, sayfaları ve sütunları kontrol edin.\n"
                 + details
             )
+
+        master, registry_join_audit, registry_match_audit = enrich_from_registries(
+            master,
+            registry_files,
+            self.hmac_secret,
+        )
+        # Faculty/department enrichment changes threshold-group assignment, so
+        # all derived fields must be recalculated after the registry join.
+        master = analyzer._derive_fields(master)
 
         scoped_master = apply_analysis_scope(master)
         analysis_master = scoped_master[scoped_master["analysis_include"]].copy()
@@ -75,6 +93,8 @@ class ReportRunner:
             "Beceri Profili": build_skill_table(analysis_master),
             "Dogrulama": build_validation_table(analysis_master),
             "Dislanan Kayitlar": excluded_table,
+            "Kutuk Esleme": registry_match_audit,
+            "Kutuk Okuma": registry_join_audit,
             "Kaynak Kalitesi": source_quality,
             "Kutuk Envanteri": registry_inventory,
             "Master Ozet": self._master_summary(scoped_master),
@@ -147,12 +167,15 @@ class ReportRunner:
         work["skill_complete"] = work[["booklet", "writing", "speaking"]].notna().all(axis=1)
         if "analysis_include" not in work:
             work["analysis_include"] = True
+        if "registry_match" not in work:
+            work["registry_match"] = False
         return (
             work.groupby(["analysis_exam_id", "academic_year", "slot"], dropna=False)
             .agg(
                 source_row_n=("student_hash", "size"),
                 analysis_included_n=("analysis_include", "sum"),
                 excluded_n=("analysis_include", lambda s: int((~s).sum())),
+                registry_matched_n=("registry_match", "sum"),
                 official_result_n=("official_result", lambda s: int(s.isin(["PASS", "FAIL"]).sum())),
                 decision_score_n=("decision_score", "count"),
                 skill_complete_n=("skill_complete", "sum"),
@@ -167,19 +190,29 @@ class ReportRunner:
         registry_files = int(registry_inventory["file"].nunique()) if not registry_inventory.empty else 0
         excluded_n = int((~master["analysis_include"]).sum()) if not master.empty and "analysis_include" in master else 0
         included_n = int(master["analysis_include"].sum()) if not master.empty and "analysis_include" in master else len(master)
+        matched_n = int(master.get("registry_match", pd.Series(False, index=master.index)).fillna(False).sum()) if not master.empty else 0
         note = (
             f"Bu çalıştırmada {recognized_files} kaynak tanındı; {len(exams)} analiz oturumu üretildi "
-            f"({', '.join(exams) if exams else 'yok'}). Ayrıca {registry_files} öğrenci kütüğü envantere alındı. "
+            f"({', '.join(exams) if exams else 'yok'}). Ayrıca {registry_files} öğrenci kütüğü okundu ve "
+            f"{matched_n} EPE kaydı öğrenci numarasının güvenli özeti üzerinden kütükle eşleştirildi. "
             f"Ana lisans analizine {included_n} kayıt dahil edildi; yüksek lisans, doktora veya dismissed statüsündeki "
             f"{excluded_n} kayıt ana tablolardan çıkarılarak ayrı denetim tablosunda tutuldu."
         )
-        if "2023-24_OCAK" in exams:
+        original_jan = (
+            not master.empty
+            and master["analysis_exam_id"].eq("2023-24_OCAK").any()
+            and master.loc[master["analysis_exam_id"].eq("2023-24_OCAK"), "skill_complete"].any()
+            if "skill_complete" in master else False
+        )
+        if original_jan:
+            note += " Ocak 2024 orijinal birleşik EPE dosyasıyla toplam, karar puanı ve beceri analizlerine tam olarak dahildir."
+        elif "2023-24_OCAK" in exams:
             note += (
                 " Ocak 2024 genel sonuç, bant ve near-miss analizlerine 2023–2024 öğrenci kütüğünden türetilen "
                 "karar puanıyla dahildir; orijinal EPE dosyası olmadığı için beceri analizine dahil değildir."
             )
         else:
-            note += " Ocak 2024 kütük alanları otomatik eşleşmediği için bu çalıştırmada analize eklenememiştir."
+            note += " Ocak 2024 bu çalıştırmada analize eklenememiştir."
         return note
 
     @staticmethod
@@ -205,6 +238,7 @@ class ReportRunner:
             *[f"- {name}: {len(frame)} satır" for name, frame in tables.items()],
             "",
             "NOT: Resmî PASS/FAIL sonucu araç tarafından değiştirilmez.",
+            "NOT: Fakülte, bölüm, burs ve giriş yılı alanları mümkün olduğunda yıllık öğrenci kütüğünden tamamlanır.",
             "NOT: Yüksek lisans, doktora ve dismissed kayıtları ana lisans analizinden çıkarılır; Dislanan Kayitlar tablosunda toplu olarak gösterilir.",
         ]
         path.write_text("\n".join(lines), encoding="utf-8")
