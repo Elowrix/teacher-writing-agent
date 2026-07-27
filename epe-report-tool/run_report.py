@@ -8,14 +8,17 @@ from tkinter import Tk, filedialog, messagebox
 from epe_report_tool.runner import ReportRunner
 
 
-def choose_files(title: str) -> list[Path]:
+def choose_files(title: str, *, allow_zip: bool = False) -> list[Path]:
     root = Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    paths = filedialog.askopenfilenames(
-        title=title,
-        filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")],
-    )
+    filetypes = [
+        ("Excel files", "*.xlsx *.xlsm"),
+    ]
+    if allow_zip:
+        filetypes.insert(0, ("EPE archive or Excel files", "*.zip *.xlsx *.xlsm"))
+    filetypes.append(("All files", "*.*"))
+    paths = filedialog.askopenfilenames(title=title, filetypes=filetypes)
     root.destroy()
     return [Path(p) for p in paths]
 
@@ -31,10 +34,13 @@ def choose_directory(title: str) -> Path | None:
 
 def main() -> int:
     print("EPE Raporlama Aracı")
-    print("1/3: EPE sonuç dosyalarını seçin.")
-    epe_files = choose_files("EPE sonuç dosyalarını seçin")
+    print("1/3: EPE ZIP arşivini veya EPE sonuç Excel dosyalarını seçin.")
+    epe_files = choose_files(
+        "EPE ZIP arşivini veya EPE sonuç Excel dosyalarını seçin",
+        allow_zip=True,
+    )
     if not epe_files:
-        print("EPE dosyası seçilmedi; işlem iptal edildi.")
+        print("EPE kaynağı seçilmedi; işlem iptal edildi.")
         return 1
 
     print("2/3: Öğrenci kütüklerini seçin.")
