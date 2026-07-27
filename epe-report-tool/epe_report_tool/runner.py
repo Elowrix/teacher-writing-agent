@@ -15,7 +15,9 @@ from .analytics import (
     build_skill_table,
     build_threshold_group_table,
     build_validation_table,
+    normalize_text,
 )
+from .registry_jan2024 import load_january_2024_from_registry
 from .report_writer import write_excel, write_powerpoint, write_word
 
 
@@ -41,17 +43,23 @@ class ReportRunner:
         master, source_quality = analyzer.load_files(epe_files)
         registry_inventory = self._inventory_registry_files(registry_files)
 
+        jan_frame, jan_quality = self._load_january_2024(registry_files)
+        if not jan_frame.empty:
+            master = pd.concat([master, jan_frame], ignore_index=True, sort=False) if not master.empty else jan_frame
+            master = analyzer._apply_last_sitting_rule(master)
+            master = analyzer._derive_fields(master)
+        if jan_quality:
+            source_quality = pd.concat([source_quality, pd.DataFrame([jan_quality])], ignore_index=True, sort=False)
+
         if master.empty:
-            recognized = source_quality[source_quality.get("status", pd.Series(dtype=str)).eq("OK")] if not source_quality.empty else pd.DataFrame()
-            if recognized.empty:
-                details = "\n".join(
-                    f"- {row.get('file', '—')}: {row.get('status', '—')} / {row.get('note', '')}"
-                    for _, row in source_quality.iterrows()
-                )
-                raise ValueError(
-                    "Seçilen EPE dosyalarından analiz tablosu üretilemedi. "
-                    "Dosya adlarının eşleme tablosundaki adlarla uyumlu olduğunu kontrol edin.\n" + details
-                )
+            details = "\n".join(
+                f"- {row.get('file', '—')}: {row.get('status', '—')} / {row.get('note', '')}"
+                for _, row in source_quality.iterrows()
+            )
+            raise ValueError(
+                "Seçilen dosyalardan analiz tablosu üretilemedi. Dosya adlarını, sayfaları ve sütunları kontrol edin.\n"
+                + details
+            )
 
         tables: dict[str, pd.DataFrame] = {
             "Genel Sonuclar": build_result_table(master),
@@ -85,6 +93,25 @@ class ReportRunner:
             "Çalışma günlüğü": log_path,
         }
 
+    def _load_january_2024(self, registry_files: list[Path]) -> tuple[pd.DataFrame, dict[str, object] | None]:
+        candidates = [
+            path for path in registry_files
+            if "2023 2024" in normalize_text(path.stem).replace("-", " ").replace("_", " ")
+            or "2023-2024" in path.stem
+        ]
+        if not candidates:
+            return pd.DataFrame(), None
+        try:
+            return load_january_2024_from_registry(candidates[0], self.hmac_secret)
+        except Exception as exc:  # noqa: BLE001
+            return pd.DataFrame(), {
+                "file": candidates[0].name,
+                "analysis_exam_id": "2023-24_OCAK",
+                "source_session_id": "2023-24_OCAK_REGISTRY",
+                "status": "REGISTRY_ADAPTER_ERROR",
+                "note": str(exc),
+            }
+
     @staticmethod
     def _inventory_registry_files(paths: Iterable[Path]) -> pd.DataFrame:
         rows: list[dict[str, object]] = []
@@ -110,38 +137,35 @@ class ReportRunner:
     def _master_summary(master: pd.DataFrame) -> pd.DataFrame:
         if master.empty:
             return pd.DataFrame()
+        work = master.copy()
+        work["skill_complete"] = work[["booklet", "writing", "speaking"]].notna().all(axis=1)
         return (
-            master.groupby(["analysis_exam_id", "academic_year", "slot"], dropna=False)
+            work.groupby(["analysis_exam_id", "academic_year", "slot"], dropna=False)
             .agg(
                 row_n=("student_hash", "size"),
                 official_result_n=("official_result", lambda s: int(s.isin(["PASS", "FAIL"]).sum())),
                 decision_score_n=("decision_score", "count"),
-                skill_complete_n=("student_hash", lambda s: 0),
+                skill_complete_n=("skill_complete", "sum"),
             )
             .reset_index()
-            .assign(
-                skill_complete_n=lambda frame: frame["analysis_exam_id"].map(
-                    master.assign(skill_complete=master[["booklet", "writing", "speaking"]].notna().all(axis=1))
-                    .groupby("analysis_exam_id")["skill_complete"].sum()
-                ).fillna(0).astype(int)
-            )
         )
 
     @staticmethod
     def _coverage_note(master: pd.DataFrame, quality: pd.DataFrame, registry_inventory: pd.DataFrame) -> str:
         exams = sorted(master["analysis_exam_id"].dropna().astype(str).unique().tolist()) if not master.empty else []
-        recognized_files = int((quality.get("status", pd.Series(dtype=str)) == "OK").sum()) if not quality.empty else 0
+        recognized_files = int(quality["status"].isin(["OK", "PARTIAL_DERIVED"]).sum()) if not quality.empty and "status" in quality else 0
         registry_files = int(registry_inventory["file"].nunique()) if not registry_inventory.empty else 0
         note = (
-            f"Bu çalıştırmada {recognized_files} EPE kaynak dosyası tanındı; "
-            f"{len(exams)} analiz oturumu üretildi ({', '.join(exams) if exams else 'yok'}). "
-            f"Ayrıca {registry_files} öğrenci kütüğü envantere alındı."
+            f"Bu çalıştırmada {recognized_files} kaynak tanındı; {len(exams)} analiz oturumu üretildi "
+            f"({', '.join(exams) if exams else 'yok'}). Ayrıca {registry_files} öğrenci kütüğü envantere alındı."
         )
-        if "2023-24_OCAK" not in exams:
+        if "2023-24_OCAK" in exams:
             note += (
-                " Ocak 2024 orijinal EPE dosyası bulunmadığından bu oturum henüz beceri analizine dahil değildir. "
-                "Kütükten türetilen Ocak 2024 adaptörü sonraki kod katmanında aynı analysis_exam_id ile bağlanacaktır."
+                " Ocak 2024 genel sonuç, bant ve near-miss analizlerine 2023–2024 öğrenci kütüğünden türetilen "
+                "karar puanıyla dahildir; orijinal EPE dosyası olmadığı için beceri analizine dahil değildir."
             )
+        else:
+            note += " Ocak 2024 kütük alanları otomatik eşleşmediği için bu çalıştırmada analize eklenememiştir."
         return note
 
     @staticmethod
