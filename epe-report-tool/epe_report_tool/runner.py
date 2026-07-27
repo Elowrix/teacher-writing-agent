@@ -19,6 +19,7 @@ from .analytics import (
 )
 from .registry_jan2024 import load_january_2024_from_registry
 from .report_writer import write_excel, write_powerpoint, write_word
+from .scope import apply_analysis_scope, build_exclusion_table
 
 
 class ReportRunner:
@@ -61,20 +62,25 @@ class ReportRunner:
                 + details
             )
 
+        scoped_master = apply_analysis_scope(master)
+        analysis_master = scoped_master[scoped_master["analysis_include"]].copy()
+        excluded_table = build_exclusion_table(scoped_master)
+
         tables: dict[str, pd.DataFrame] = {
-            "Genel Sonuclar": build_result_table(master),
-            "Near Miss": build_near_miss_table(master),
-            "Bantlar": build_band_table(master),
-            "Esik Gruplari": build_threshold_group_table(master),
-            "Fakulte Burs": build_faculty_scholarship_table(master),
-            "Beceri Profili": build_skill_table(master),
-            "Dogrulama": build_validation_table(master),
+            "Genel Sonuclar": build_result_table(analysis_master),
+            "Near Miss": build_near_miss_table(analysis_master),
+            "Bantlar": build_band_table(analysis_master),
+            "Esik Gruplari": build_threshold_group_table(analysis_master),
+            "Fakulte Burs": build_faculty_scholarship_table(analysis_master),
+            "Beceri Profili": build_skill_table(analysis_master),
+            "Dogrulama": build_validation_table(analysis_master),
+            "Dislanan Kayitlar": excluded_table,
             "Kaynak Kalitesi": source_quality,
             "Kutuk Envanteri": registry_inventory,
-            "Master Ozet": self._master_summary(master),
+            "Master Ozet": self._master_summary(scoped_master),
         }
 
-        coverage_note = self._coverage_note(master, source_quality, registry_inventory)
+        coverage_note = self._coverage_note(scoped_master, source_quality, registry_inventory)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         excel_path = output_dir / f"EPE_Analiz_Tablolari_{timestamp}.xlsx"
         word_path = output_dir / f"EPE_Yillar_Arasi_Analiz_Raporu_{timestamp}.docx"
@@ -139,10 +145,14 @@ class ReportRunner:
             return pd.DataFrame()
         work = master.copy()
         work["skill_complete"] = work[["booklet", "writing", "speaking"]].notna().all(axis=1)
+        if "analysis_include" not in work:
+            work["analysis_include"] = True
         return (
             work.groupby(["analysis_exam_id", "academic_year", "slot"], dropna=False)
             .agg(
-                row_n=("student_hash", "size"),
+                source_row_n=("student_hash", "size"),
+                analysis_included_n=("analysis_include", "sum"),
+                excluded_n=("analysis_include", lambda s: int((~s).sum())),
                 official_result_n=("official_result", lambda s: int(s.isin(["PASS", "FAIL"]).sum())),
                 decision_score_n=("decision_score", "count"),
                 skill_complete_n=("skill_complete", "sum"),
@@ -155,9 +165,13 @@ class ReportRunner:
         exams = sorted(master["analysis_exam_id"].dropna().astype(str).unique().tolist()) if not master.empty else []
         recognized_files = int(quality["status"].isin(["OK", "PARTIAL_DERIVED"]).sum()) if not quality.empty and "status" in quality else 0
         registry_files = int(registry_inventory["file"].nunique()) if not registry_inventory.empty else 0
+        excluded_n = int((~master["analysis_include"]).sum()) if not master.empty and "analysis_include" in master else 0
+        included_n = int(master["analysis_include"].sum()) if not master.empty and "analysis_include" in master else len(master)
         note = (
             f"Bu çalıştırmada {recognized_files} kaynak tanındı; {len(exams)} analiz oturumu üretildi "
-            f"({', '.join(exams) if exams else 'yok'}). Ayrıca {registry_files} öğrenci kütüğü envantere alındı."
+            f"({', '.join(exams) if exams else 'yok'}). Ayrıca {registry_files} öğrenci kütüğü envantere alındı. "
+            f"Ana lisans analizine {included_n} kayıt dahil edildi; yüksek lisans, doktora veya dismissed statüsündeki "
+            f"{excluded_n} kayıt ana tablolardan çıkarılarak ayrı denetim tablosunda tutuldu."
         )
         if "2023-24_OCAK" in exams:
             note += (
@@ -191,5 +205,6 @@ class ReportRunner:
             *[f"- {name}: {len(frame)} satır" for name, frame in tables.items()],
             "",
             "NOT: Resmî PASS/FAIL sonucu araç tarafından değiştirilmez.",
+            "NOT: Yüksek lisans, doktora ve dismissed kayıtları ana lisans analizinden çıkarılır; Dislanan Kayitlar tablosunda toplu olarak gösterilir.",
         ]
         path.write_text("\n".join(lines), encoding="utf-8")
