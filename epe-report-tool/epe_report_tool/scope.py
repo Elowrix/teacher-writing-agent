@@ -24,14 +24,17 @@ def classify_exclusion(row: pd.Series) -> str | None:
     """
     administrative = _norm(row.get("administrative_status"))
     level = _norm(row.get("student_level"))
-    combined = f"{administrative} {level}"
+    faculty = _norm(row.get("faculty"))
+    department = _norm(row.get("department"))
+    combined = f"{administrative} {level} {faculty} {department}"
 
     if "dismissed" in combined or "ilisigi kes" in combined or "ilisik kes" in combined:
         return "ADMINISTRATIVE_STATUS_DISMISSED"
 
     master_patterns = (
         r"\bmaster\b", r"master'?s", r"master program", r"graduate candidate",
-        r"yuksek lisans", r"y\.\s*lisans", r"\byl[-_\s]", r"\byl\b",
+        r"graduate school", r"institute of graduate", r"lisansustu programlar enstitusu",
+        r"lisansustu", r"yuksek lisans", r"y\.\s*lisans", r"\byl[-_\s]", r"\byl\b",
     )
     if any(re.search(pattern, combined) for pattern in master_patterns):
         return "STUDENT_LEVEL_MASTER"
