@@ -1,36 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from pptx import Presentation
-from pptx.util import Inches, Pt
 
-
-@dataclass(frozen=True)
-class WorkbookInventory:
-    file_name: str
-    file_type: str
-    sheet_name: str
-    rows: int
-    columns: int
-    status: str
-    note: str = ""
+from .analytics import (
+    EPEAnalyzer,
+    build_band_table,
+    build_faculty_scholarship_table,
+    build_near_miss_table,
+    build_result_table,
+    build_skill_table,
+    build_threshold_group_table,
+    build_validation_table,
+)
+from .report_writer import write_excel, write_powerpoint, write_word
 
 
 class ReportRunner:
-    """Initial dashboard-free report production pipeline.
-
-    This first implementation inventories the selected workbooks, records sheet
-    dimensions, produces a quality-control workbook, and generates draft Word and
-    PowerPoint outputs from the same inventory. Session-specific EPE parsers and
-    the 12-question analytics are added on top of this stable entry point.
-    """
+    """Dashboard-free EPE analysis and report production pipeline."""
 
     def __init__(self, project_root: Path, hmac_secret: str) -> None:
         self.project_root = project_root
@@ -44,182 +34,138 @@ class ReportRunner:
         output_dir: Path,
     ) -> dict[str, Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
-        inventory = self._build_inventory(epe_files=epe_files, registry_files=registry_files)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        epe_files = list(epe_files)
+        registry_files = list(registry_files)
 
-        excel_path = output_dir / f"EPE_Veri_Kalite_Ozeti_{timestamp}.xlsx"
-        word_path = output_dir / f"EPE_Yillar_Arasi_Analiz_Raporu_{timestamp}.docx"
-        ppt_path = output_dir / f"EPE_Yonetim_Sunumu_{timestamp}.pptx"
+        analyzer = EPEAnalyzer(self.hmac_secret)
+        master, source_quality = analyzer.load_files(epe_files)
+        registry_inventory = self._inventory_registry_files(registry_files)
 
-        self._write_excel(inventory, excel_path)
-        self._write_word(inventory, word_path)
-        self._write_powerpoint(inventory, ppt_path)
+        if master.empty:
+            recognized = source_quality[source_quality.get("status", pd.Series(dtype=str)).eq("OK")] if not source_quality.empty else pd.DataFrame()
+            if recognized.empty:
+                details = "\n".join(
+                    f"- {row.get('file', '—')}: {row.get('status', '—')} / {row.get('note', '')}"
+                    for _, row in source_quality.iterrows()
+                )
+                raise ValueError(
+                    "Seçilen EPE dosyalarından analiz tablosu üretilemedi. "
+                    "Dosya adlarının eşleme tablosundaki adlarla uyumlu olduğunu kontrol edin.\n" + details
+                )
 
-        return {
-            "Veri kalite özeti": excel_path,
-            "Word raporu": word_path,
-            "PowerPoint sunumu": ppt_path,
+        tables: dict[str, pd.DataFrame] = {
+            "Genel Sonuclar": build_result_table(master),
+            "Near Miss": build_near_miss_table(master),
+            "Bantlar": build_band_table(master),
+            "Esik Gruplari": build_threshold_group_table(master),
+            "Fakulte Burs": build_faculty_scholarship_table(master),
+            "Beceri Profili": build_skill_table(master),
+            "Dogrulama": build_validation_table(master),
+            "Kaynak Kalitesi": source_quality,
+            "Kutuk Envanteri": registry_inventory,
+            "Master Ozet": self._master_summary(master),
         }
 
-    def _build_inventory(
-        self,
-        *,
-        epe_files: Iterable[Path],
-        registry_files: Iterable[Path],
-    ) -> pd.DataFrame:
-        rows: list[WorkbookInventory] = []
-        for file_type, paths in (("EPE", epe_files), ("Öğrenci kütüğü", registry_files)):
-            for path in paths:
-                if not path.exists():
-                    rows.append(
-                        WorkbookInventory(
-                            file_name=path.name,
-                            file_type=file_type,
-                            sheet_name="—",
-                            rows=0,
-                            columns=0,
-                            status="HATA",
-                            note="Dosya bulunamadı",
-                        )
-                    )
-                    continue
+        coverage_note = self._coverage_note(master, source_quality, registry_inventory)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        excel_path = output_dir / f"EPE_Analiz_Tablolari_{timestamp}.xlsx"
+        word_path = output_dir / f"EPE_Yillar_Arasi_Analiz_Raporu_{timestamp}.docx"
+        ppt_path = output_dir / f"EPE_Yonetim_Sunumu_{timestamp}.pptx"
+        log_path = output_dir / f"EPE_Calisma_Gunlugu_{timestamp}.txt"
+
+        write_excel(excel_path, tables)
+        write_word(word_path, tables, coverage_note)
+        write_powerpoint(ppt_path, tables, coverage_note)
+        self._write_log(log_path, epe_files, registry_files, tables, coverage_note)
+
+        return {
+            "Excel analiz tabloları": excel_path,
+            "Word raporu": word_path,
+            "PowerPoint sunumu": ppt_path,
+            "Çalışma günlüğü": log_path,
+        }
+
+    @staticmethod
+    def _inventory_registry_files(paths: Iterable[Path]) -> pd.DataFrame:
+        rows: list[dict[str, object]] = []
+        for path in paths:
+            if not path.exists():
+                rows.append({"file": path.name, "status": "ERROR", "sheet": "—", "rows": 0, "columns": 0, "note": "Dosya bulunamadı"})
+                continue
+            try:
+                workbook = pd.ExcelFile(path)
+            except Exception as exc:  # noqa: BLE001
+                rows.append({"file": path.name, "status": "ERROR", "sheet": "—", "rows": 0, "columns": 0, "note": str(exc)})
+                continue
+            for sheet in workbook.sheet_names:
                 try:
-                    workbook = pd.ExcelFile(path)
+                    frame = pd.read_excel(path, sheet_name=sheet, header=None)
+                    rows.append({"file": path.name, "status": "OK", "sheet": sheet,
+                                 "rows": int(frame.shape[0]), "columns": int(frame.shape[1]), "note": ""})
                 except Exception as exc:  # noqa: BLE001
-                    rows.append(
-                        WorkbookInventory(
-                            file_name=path.name,
-                            file_type=file_type,
-                            sheet_name="—",
-                            rows=0,
-                            columns=0,
-                            status="HATA",
-                            note=str(exc),
-                        )
-                    )
-                    continue
-
-                for sheet in workbook.sheet_names:
-                    try:
-                        frame = pd.read_excel(path, sheet_name=sheet, header=None)
-                        rows.append(
-                            WorkbookInventory(
-                                file_name=path.name,
-                                file_type=file_type,
-                                sheet_name=str(sheet),
-                                rows=int(frame.shape[0]),
-                                columns=int(frame.shape[1]),
-                                status="OK",
-                            )
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        rows.append(
-                            WorkbookInventory(
-                                file_name=path.name,
-                                file_type=file_type,
-                                sheet_name=str(sheet),
-                                rows=0,
-                                columns=0,
-                                status="HATA",
-                                note=str(exc),
-                            )
-                        )
-
-        return pd.DataFrame([item.__dict__ for item in rows])
+                    rows.append({"file": path.name, "status": "ERROR", "sheet": sheet, "rows": 0, "columns": 0, "note": str(exc)})
+        return pd.DataFrame(rows)
 
     @staticmethod
-    def _write_excel(inventory: pd.DataFrame, path: Path) -> None:
-        summary = (
-            inventory.groupby(["file_type", "status"], dropna=False)
-            .size()
-            .reset_index(name="sheet_count")
-        )
-        with pd.ExcelWriter(path, engine="openpyxl") as writer:
-            inventory.to_excel(writer, sheet_name="Kaynak Envanteri", index=False)
-            summary.to_excel(writer, sheet_name="Özet", index=False)
-
-    @staticmethod
-    def _write_word(inventory: pd.DataFrame, path: Path) -> None:
-        document = Document()
-        title = document.add_heading("EPE Yıllar Arası Analiz Raporu", level=0)
-        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        paragraph = document.add_paragraph(
-            "Bu sürüm, seçilen EPE sonuç dosyaları ve öğrenci kütüklerinin kaynak "
-            "envanterini doğrular. Oturum bazlı analizler ve 12 temel sorunun sonuçları "
-            "aynı rapor üretim hattına eklenecektir."
-        )
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-
-        document.add_heading("1. Kaynak Dosya Özeti", level=1)
-        file_summary = (
-            inventory.groupby(["file_type", "file_name"], dropna=False)
-            .agg(sheet_count=("sheet_name", "count"), error_count=("status", lambda s: int((s == "HATA").sum())))
+    def _master_summary(master: pd.DataFrame) -> pd.DataFrame:
+        if master.empty:
+            return pd.DataFrame()
+        return (
+            master.groupby(["analysis_exam_id", "academic_year", "slot"], dropna=False)
+            .agg(
+                row_n=("student_hash", "size"),
+                official_result_n=("official_result", lambda s: int(s.isin(["PASS", "FAIL"]).sum())),
+                decision_score_n=("decision_score", "count"),
+                skill_complete_n=("student_hash", lambda s: 0),
+            )
             .reset_index()
+            .assign(
+                skill_complete_n=lambda frame: frame["analysis_exam_id"].map(
+                    master.assign(skill_complete=master[["booklet", "writing", "speaking"]].notna().all(axis=1))
+                    .groupby("analysis_exam_id")["skill_complete"].sum()
+                ).fillna(0).astype(int)
+            )
         )
-        table = document.add_table(rows=1, cols=4)
-        table.style = "Table Grid"
-        headers = ["Kaynak türü", "Dosya", "Sayfa sayısı", "Hatalı sayfa"]
-        for index, text in enumerate(headers):
-            table.rows[0].cells[index].text = text
-        for _, row in file_summary.iterrows():
-            cells = table.add_row().cells
-            cells[0].text = str(row["file_type"])
-            cells[1].text = str(row["file_name"])
-            cells[2].text = str(row["sheet_count"])
-            cells[3].text = str(row["error_count"])
-
-        document.add_heading("2. Sonraki Analiz Katmanı", level=1)
-        for item in (
-            "PASS/FAIL oranlarının aynı EPE yuvası içinde yıllar arasında karşılaştırılması",
-            "Near-miss ve sınırda geçen öğrencilerin kendi karar eşiklerine göre belirlenmesi",
-            "ELL–ELT ve diğer lisans programlarının ayrı raporlanması",
-            "Fakülte ve burs kırılımları",
-            "Booklet, Writing, Speaking ve Productive beceri profilleri",
-            "Aynı doğrulanmış tablolardan Word ve PowerPoint üretimi",
-        ):
-            document.add_paragraph(item, style="List Bullet")
-
-        document.save(path)
 
     @staticmethod
-    def _write_powerpoint(inventory: pd.DataFrame, path: Path) -> None:
-        presentation = Presentation()
-
-        slide = presentation.slides.add_slide(presentation.slide_layouts[0])
-        slide.shapes.title.text = "EPE Yıllar Arası Analiz"
-        slide.placeholders[1].text = "Kaynak doğrulama ve rapor üretim aracı"
-
-        slide = presentation.slides.add_slide(presentation.slide_layouts[5])
-        slide.shapes.title.text = "Yüklenen Kaynaklar"
-        summary = (
-            inventory.groupby("file_type", dropna=False)["file_name"]
-            .nunique()
-            .reset_index(name="file_count")
+    def _coverage_note(master: pd.DataFrame, quality: pd.DataFrame, registry_inventory: pd.DataFrame) -> str:
+        exams = sorted(master["analysis_exam_id"].dropna().astype(str).unique().tolist()) if not master.empty else []
+        recognized_files = int((quality.get("status", pd.Series(dtype=str)) == "OK").sum()) if not quality.empty else 0
+        registry_files = int(registry_inventory["file"].nunique()) if not registry_inventory.empty else 0
+        note = (
+            f"Bu çalıştırmada {recognized_files} EPE kaynak dosyası tanındı; "
+            f"{len(exams)} analiz oturumu üretildi ({', '.join(exams) if exams else 'yok'}). "
+            f"Ayrıca {registry_files} öğrenci kütüğü envantere alındı."
         )
-        textbox = slide.shapes.add_textbox(Inches(1), Inches(1.6), Inches(8), Inches(4.5))
-        frame = textbox.text_frame
-        frame.clear()
-        for idx, row in summary.iterrows():
-            paragraph = frame.paragraphs[0] if idx == 0 else frame.add_paragraph()
-            paragraph.text = f"{row['file_type']}: {row['file_count']} dosya"
-            paragraph.font.size = Pt(24)
-            paragraph.space_after = Pt(12)
+        if "2023-24_OCAK" not in exams:
+            note += (
+                " Ocak 2024 orijinal EPE dosyası bulunmadığından bu oturum henüz beceri analizine dahil değildir. "
+                "Kütükten türetilen Ocak 2024 adaptörü sonraki kod katmanında aynı analysis_exam_id ile bağlanacaktır."
+            )
+        return note
 
-        slide = presentation.slides.add_slide(presentation.slide_layouts[5])
-        slide.shapes.title.text = "Raporlama Omurgası"
-        textbox = slide.shapes.add_textbox(Inches(0.9), Inches(1.5), Inches(8.3), Inches(4.8))
-        frame = textbox.text_frame
-        items = [
-            "Kaynak dosya ve sayfa doğrulaması",
-            "Oturum bazlı harmonizasyon",
-            "PASS/FAIL, eşik bandı ve near-miss analizleri",
-            "Fakülte, burs ve beceri profilleri",
-            "Word raporu ve yönetim sunumu",
+    @staticmethod
+    def _write_log(
+        path: Path,
+        epe_files: list[Path],
+        registry_files: list[Path],
+        tables: dict[str, pd.DataFrame],
+        coverage_note: str,
+    ) -> None:
+        lines = [
+            "EPE RAPORLAMA ARACI - ÇALIŞMA GÜNLÜĞÜ",
+            "",
+            coverage_note,
+            "",
+            "EPE DOSYALARI:",
+            *[f"- {path}" for path in epe_files],
+            "",
+            "ÖĞRENCİ KÜTÜKLERİ:",
+            *[f"- {path}" for path in registry_files],
+            "",
+            "ÜRETİLEN TABLOLAR:",
+            *[f"- {name}: {len(frame)} satır" for name, frame in tables.items()],
+            "",
+            "NOT: Resmî PASS/FAIL sonucu araç tarafından değiştirilmez.",
         ]
-        for idx, item in enumerate(items):
-            paragraph = frame.paragraphs[0] if idx == 0 else frame.add_paragraph()
-            paragraph.text = item
-            paragraph.font.size = Pt(22)
-            paragraph.level = 0
-
-        presentation.save(path)
+        path.write_text("\n".join(lines), encoding="utf-8")
