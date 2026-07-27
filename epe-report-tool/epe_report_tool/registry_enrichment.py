@@ -23,6 +23,16 @@ CANONICAL_FACULTIES = {
     "Economics and Administrative Sciences",
 }
 
+# Institutional rule: registry files are descriptive enrichment sources only.
+# They must never create or overwrite official result, decision score,
+# administrative status, student level, or exclusion decisions.
+REGISTRY_ENRICHMENT_FIELDS = (
+    "faculty",
+    "department",
+    "scholarship",
+    "entry_year",
+)
+
 
 def _detect_academic_year(path: Path) -> str | None:
     text = normalize_text(path.stem).replace("_", " ").replace("-", " ")
@@ -53,7 +63,11 @@ def _find_header_row(path: Path, sheet: str) -> int:
     best_score = -1
     for row_index, row in preview.iterrows():
         values = [normalize_text(value) for value in row.tolist()]
-        score = sum(1 for value in values if any(token == value or token in value for token in header_tokens))
+        score = sum(
+            1
+            for value in values
+            if any(token == value or token in value for token in header_tokens)
+        )
         if score > best_score:
             best_row = int(row_index)
             best_score = score
@@ -67,7 +81,6 @@ def _column_groups(columns: Iterable[object]) -> dict[str, list[str]]:
         "department": [],
         "scholarship": [],
         "entry_year": [],
-        "status": [],
     }
     for column in columns:
         original = str(column)
@@ -75,7 +88,10 @@ def _column_groups(columns: Iterable[object]) -> dict[str, list[str]]:
         if not norm or norm.startswith("unnamed"):
             continue
 
-        if norm in {"id", "student id", "student no", "student number", "id no", "ogrenci numarasi", "öğrenci numarası", "tc"}:
+        if norm in {
+            "id", "student id", "student no", "student number", "id no",
+            "ogrenci numarasi", "öğrenci numarası", "tc",
+        }:
             groups["student_id"].append(original)
         elif "student id" in norm or "student number" in norm or "ogrenci numara" in norm:
             groups["student_id"].append(original)
@@ -84,19 +100,12 @@ def _column_groups(columns: Iterable[object]) -> dict[str, list[str]]:
             groups["faculty"].append(original)
         if norm in {"department", "program", "bolum", "bölüm"}:
             groups["department"].append(original)
-        if norm in {"scholarship", "scholarship rate", "burs", "burs orani", "burs oranı"}:
+        if norm in {
+            "scholarship", "scholarship rate", "burs", "burs orani", "burs oranı",
+        }:
             groups["scholarship"].append(original)
         if norm in {"entry year", "entrance year", "giris yili", "giriş yılı"}:
             groups["entry_year"].append(original)
-
-        status_like = (
-            "status" in norm
-            or norm == "durum"
-            or "kayit sildir" in norm
-            or "kayıt sildir" in original.casefold()
-        )
-        if status_like and "fail/pass" not in norm and "grades" not in norm and "scores" not in norm:
-            groups["status"].append(original)
     return groups
 
 
@@ -123,23 +132,11 @@ def _canonical_faculty(row: pd.Series, columns: list[str]) -> object:
     return pd.NA
 
 
-def _combined_status(row: pd.Series, columns: list[str]) -> object:
-    values: list[str] = []
-    for column in columns:
-        value = row.get(column)
-        if value is None or pd.isna(value):
-            continue
-        text = str(value).strip()
-        if not text or text.casefold() in {"nan", "none", "#n/a"}:
-            continue
-        if text not in values:
-            values.append(text)
-    return " | ".join(values) if values else pd.NA
-
-
 def _completeness(record: dict[str, object]) -> int:
     return sum(
-        value is not None and not pd.isna(value) and str(value).strip() not in {"", "#N/A"}
+        value is not None
+        and not pd.isna(value)
+        and str(value).strip() not in {"", "#N/A"}
         for key, value in record.items()
         if key not in {"academic_year", "student_hash"}
     )
@@ -191,9 +188,10 @@ def build_registry_lookup(
                     "academic_year": academic_year,
                     "faculty_registry": _canonical_faculty(row, groups["faculty"]),
                     "department_registry": _first_nonempty(row, groups["department"]),
-                    "scholarship_registry": normalize_scholarship(_first_nonempty(row, groups["scholarship"])),
+                    "scholarship_registry": normalize_scholarship(
+                        _first_nonempty(row, groups["scholarship"])
+                    ),
                     "entry_year_registry": _first_nonempty(row, groups["entry_year"]),
-                    "administrative_status_registry": _combined_status(row, groups["status"]),
                     "registry_source_file": path.name,
                     "registry_source_sheet": sheet,
                 }
@@ -224,7 +222,11 @@ def build_registry_lookup(
                 "department_columns": " | ".join(groups["department"]),
                 "lookup_id_n": int(len(file_keys)),
                 "conflict_n": int(conflict_n),
-                "note": "Kütük alanları öğrenci numarası HMAC özeti üzerinden eşleştirilir.",
+                "note": (
+                    "Kütük yalnız fakülte, bölüm, burs ve giriş yılı alanlarını "
+                    "öğrenci numarası HMAC özeti üzerinden tamamlar; öğrenci düzeyi "
+                    "ve idari statü kütükten alınmaz."
+                ),
             })
         except Exception as exc:  # noqa: BLE001
             audit_rows.append({
@@ -240,7 +242,9 @@ def build_registry_lookup(
 
     lookup_frame = pd.DataFrame(list(lookup.values()))
     if not lookup_frame.empty:
-        lookup_frame = lookup_frame.drop_duplicates(["academic_year", "student_hash"], keep="last")
+        lookup_frame = lookup_frame.drop_duplicates(
+            ["academic_year", "student_hash"], keep="last"
+        )
     return lookup_frame, pd.DataFrame(audit_rows)
 
 
@@ -254,6 +258,7 @@ def enrich_from_registries(
     registry_files: Iterable[Path],
     hmac_secret: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Complete descriptive fields without changing scope or official status."""
     lookup, registry_audit = build_registry_lookup(registry_files, hmac_secret)
     if master.empty:
         return master.copy(), registry_audit, pd.DataFrame()
@@ -277,19 +282,16 @@ def enrich_from_registries(
     work["scholarship"] = work["scholarship_registry"].combine_first(work["scholarship"])
     work["entry_year"] = work["entry_year_registry"].combine_first(work["entry_year"])
 
-    source_status = work["administrative_status"].fillna("").astype(str).str.strip()
-    registry_status = work["administrative_status_registry"].fillna("").astype(str).str.strip()
-    combined_status = source_status
-    both = source_status.ne("") & registry_status.ne("")
-    combined_status = combined_status.mask(source_status.eq(""), registry_status)
-    combined_status = combined_status.mask(both, source_status + " | " + registry_status)
-    work["administrative_status"] = combined_status.replace("", pd.NA)
-
     drop_columns = [
-        "faculty_registry", "department_registry", "scholarship_registry",
-        "entry_year_registry", "administrative_status_registry",
+        "faculty_registry",
+        "department_registry",
+        "scholarship_registry",
+        "entry_year_registry",
     ]
-    work.drop(columns=[column for column in drop_columns if column in work], inplace=True)
+    work.drop(
+        columns=[column for column in drop_columns if column in work],
+        inplace=True,
+    )
     return work, registry_audit, _match_audit(work)
 
 
@@ -297,7 +299,11 @@ def _match_audit(master: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for exam_id, group in master.groupby("analysis_exam_id", dropna=False):
         n = int(len(group))
-        matched = int(group.get("registry_match", pd.Series(False, index=group.index)).fillna(False).sum())
+        matched = int(
+            group.get("registry_match", pd.Series(False, index=group.index))
+            .fillna(False)
+            .sum()
+        )
         faculty_known = int(group["faculty"].isin(CANONICAL_FACULTIES).sum())
         department_known = int(group["department"].notna().sum())
         rows.append({
@@ -308,5 +314,6 @@ def _match_audit(master: pd.DataFrame) -> pd.DataFrame:
             "faculty_known_N": faculty_known,
             "faculty_unknown_N": n - faculty_known,
             "department_known_N": department_known,
+            "status_or_level_from_registry_N": 0,
         })
     return pd.DataFrame(rows).sort_values("analysis_exam_id").reset_index(drop=True)
