@@ -17,32 +17,51 @@ def _norm(value: object) -> str:
 
 
 def classify_exclusion(row: pd.Series) -> str | None:
-    """Return the main undergraduate-analysis exclusion reason, if any.
+    """Return an exclusion reason only from explicit EPE-source status fields.
 
-    Source records are retained for audit. This function only controls the core
-    undergraduate EPE tables and does not rewrite official PASS/FAIL.
+    Institutional rule:
+    - Registry files may complete faculty, department, scholarship and entry year.
+    - Registry faculty/department/status text must never create a MASTER, PHD or
+      DISMISSED classification.
+    - A record is excluded only when the EPE source itself populated
+      ``administrative_status`` or ``student_level`` with an explicit marker.
     """
     administrative = _norm(row.get("administrative_status"))
     level = _norm(row.get("student_level"))
-    faculty = _norm(row.get("faculty"))
-    department = _norm(row.get("department"))
-    combined = f"{administrative} {level} {faculty} {department}"
 
-    if "dismissed" in combined or "ilisigi kes" in combined or "ilisik kes" in combined:
+    if (
+        "dismissed" in administrative
+        or "ilisigi kes" in administrative
+        or "ilisik kes" in administrative
+    ):
         return "ADMINISTRATIVE_STATUS_DISMISSED"
 
     master_patterns = (
-        r"\bmaster\b", r"master'?s", r"master program", r"graduate candidate",
-        r"graduate school", r"institute of graduate", r"lisansustu programlar enstitusu",
-        r"lisansustu", r"yuksek lisans", r"y\.\s*lisans", r"\byl[-_\s]", r"\byl\b",
+        r"\bmaster\b",
+        r"master'?s",
+        r"master program",
+        r"graduate candidate",
+        r"graduate school",
+        r"institute of graduate",
+        r"lisansustu programlar enstitusu",
+        r"lisansustu",
+        r"yuksek lisans",
+        r"y\.\s*lisans",
+        r"\byl[-_\s]",
+        r"\byl\b",
     )
-    if any(re.search(pattern, combined) for pattern in master_patterns):
+    if any(re.search(pattern, level) for pattern in master_patterns):
         return "STUDENT_LEVEL_MASTER"
 
     phd_patterns = (
-        r"\bphd\b", r"doctoral", r"doctorate", r"doktora", r"\bdr[-_\s]", r"\bdr\b",
+        r"\bphd\b",
+        r"doctoral",
+        r"doctorate",
+        r"doktora",
+        r"\bdr[-_\s]",
+        r"\bdr\b",
     )
-    if any(re.search(pattern, combined) for pattern in phd_patterns):
+    if any(re.search(pattern, level) for pattern in phd_patterns):
         return "STUDENT_LEVEL_PHD"
 
     return None
@@ -69,7 +88,14 @@ def build_exclusion_table(master: pd.DataFrame) -> pd.DataFrame:
     excluded = master[~master["analysis_include"]].copy()
     if excluded.empty:
         return pd.DataFrame(columns=[
-            "analysis_exam_id", "academic_year", "slot", "exclusion_reason", "N", "PASS", "FAIL", "ABSENT"
+            "analysis_exam_id",
+            "academic_year",
+            "slot",
+            "exclusion_reason",
+            "N",
+            "PASS",
+            "FAIL",
+            "ABSENT",
         ])
 
     rows: list[dict[str, object]] = []
