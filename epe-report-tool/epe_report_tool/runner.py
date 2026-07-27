@@ -17,6 +17,16 @@ from .analytics import (
     build_validation_table,
     normalize_text,
 )
+from .extra_tables import (
+    add_cell_size_flag,
+    build_exam_type_table,
+    build_faculty_near_miss_table,
+    build_near_miss_limitations,
+    build_participation_table,
+    build_quality_issue_table,
+    build_question_coverage_table,
+    build_threshold_concentration_table,
+)
 from .registry_enrichment import enrich_from_registries
 from .registry_jan2024 import load_january_2024_from_registry
 from .report_writer import write_excel, write_powerpoint, write_word
@@ -45,8 +55,6 @@ class ReportRunner:
         master, source_quality = analyzer.load_files(epe_files)
         registry_inventory = self._inventory_registry_files(registry_files)
 
-        # Use the registry-derived January 2024 fallback only when the original
-        # 2023_2024_EPE source was not selected.
         original_jan_present = (
             not master.empty
             and "analysis_exam_id" in master
@@ -76,21 +84,30 @@ class ReportRunner:
             registry_files,
             self.hmac_secret,
         )
-        # Faculty/department enrichment changes threshold-group assignment, so
-        # all derived fields must be recalculated after the registry join.
         master = analyzer._derive_fields(master)
 
         scoped_master = apply_analysis_scope(master)
         analysis_master = scoped_master[scoped_master["analysis_include"]].copy()
         excluded_table = build_exclusion_table(scoped_master)
 
+        result_table = build_result_table(analysis_master)
+        near_table = build_near_miss_table(analysis_master)
+        faculty_burs = build_faculty_scholarship_table(analysis_master)
+        if not faculty_burs.empty:
+            faculty_burs = add_cell_size_flag(faculty_burs, "N")
+
         tables: dict[str, pd.DataFrame] = {
-            "Genel Sonuclar": build_result_table(analysis_master),
-            "Near Miss": build_near_miss_table(analysis_master),
+            "Katilim Ozeti": build_participation_table(analysis_master),
+            "Genel Sonuclar": result_table,
+            "Near Miss": near_table,
+            "Near Miss Sinirlilik": build_near_miss_limitations(analysis_master, near_table),
             "Bantlar": build_band_table(analysis_master),
+            "Esik Yogunlugu": build_threshold_concentration_table(analysis_master),
             "Esik Gruplari": build_threshold_group_table(analysis_master),
-            "Fakulte Burs": build_faculty_scholarship_table(analysis_master),
+            "Fakulte Near Miss": build_faculty_near_miss_table(analysis_master),
+            "Fakulte Burs": faculty_burs,
             "Beceri Profili": build_skill_table(analysis_master),
+            "Sinav Turu": build_exam_type_table(analysis_master),
             "Dogrulama": build_validation_table(analysis_master),
             "Dislanan Kayitlar": excluded_table,
             "Kutuk Esleme": registry_match_audit,
@@ -99,6 +116,12 @@ class ReportRunner:
             "Kutuk Envanteri": registry_inventory,
             "Master Ozet": self._master_summary(scoped_master),
         }
+        tables["Kalite Sorunlari"] = build_quality_issue_table(
+            source_quality,
+            registry_match_audit,
+            registry_join_audit,
+        )
+        tables["12 Soru Kapsami"] = build_question_coverage_table(tables)
 
         coverage_note = self._coverage_note(scoped_master, source_quality, registry_inventory)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
